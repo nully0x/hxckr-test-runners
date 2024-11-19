@@ -21,74 +21,81 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.DROPLET_IP }} >> ~/.ssh/known_hosts
 
-      - name: Install and Configure SSL
+      - name: Verify Domain and Setup SSL
         run: |
           ssh ${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_IP }} << 'EOF'
-          # Install Certbot if not already installed
-          if ! command -v certbot &> /dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y certbot
+          # First, let's check DNS resolution
+          echo "Checking DNS resolution..."
+          DOMAIN="${{ github.event.inputs.domain }}"
+          DROPLET_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
+          DOMAIN_IP=$(dig +short $DOMAIN)
+
+          echo "Droplet IP: $DROPLET_IP"
+          echo "Domain IP: $DOMAIN_IP"
+
+          if [ "$DROPLET_IP" != "$DOMAIN_IP" ]; then
+            echo "WARNING: Domain is not pointing to this server!"
+            echo "Please update DNS A record for $DOMAIN to point to $DROPLET_IP"
+            exit 1
           fi
 
-          # Install and configure Nginx if not already installed
-          if ! command -v nginx &> /dev/null; then
-            sudo apt-get install -y nginx
+          # Check if ports are open
+          echo "Checking if port 80 is available..."
+          if netstat -tuln | grep ':80'; then
+            echo "Port 80 is in use. Stopping potential services..."
+            sudo systemctl stop nginx
+            sleep 5
           fi
 
-          # Configure UFW (firewall)
+          # Configure firewall
+          echo "Configuring firewall..."
           sudo ufw allow 80/tcp
           sudo ufw allow 443/tcp
-          sudo ufw allow 'Nginx Full'
-
-          # Make sure UFW is enabled
           sudo ufw --force enable
 
-          # Stop any service that might be using port 80
-          sudo systemctl stop nginx
+          # Install required packages
+          echo "Installing required packages..."
+          sudo apt-get update
+          sudo apt-get install -y certbot nginx
 
-          # Wait a bit for the port to be fully released
-          sleep 5
-
-          # Verify port 80 is free
-          if netstat -tuln | grep ':80'; then
-            echo "Warning: Port 80 is still in use"
-            netstat -tuln | grep ':80'
-          fi
-
-          # Get SSL certificate with verbose output
+          # Attempt to get certificate with debugging
+          echo "Attempting to obtain SSL certificate..."
           sudo certbot certonly --standalone \
             --preferred-challenges http \
             --agree-tos \
             --non-interactive \
             --verbose \
+            --debug \
             --email ${{ secrets.SSL_EMAIL }} \
-            -d ${{ github.event.inputs.domain }}
+            -d $DOMAIN
 
-          # Verify certificate files exist
-          if [ ! -d "/etc/letsencrypt/live/${{ github.event.inputs.domain }}" ]; then
-            echo "Certificate directory not found!"
-            exit 1
-          fi
+          # Check certificate status
+          if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
+            echo "Certificate obtained successfully!"
 
-          # Create Nginx configuration with proper escaping
-          sudo tee /etc/nginx/sites-available/${{ github.event.inputs.domain }} << CONF
+            # Configure Nginx
+            echo "Configuring Nginx..."
+            sudo tee /etc/nginx/sites-available/$DOMAIN << CONF
           server {
               listen 80;
-              server_name ${{ github.event.inputs.domain }};
-              return 301 https://\$host\$request_uri;
+              server_name $DOMAIN;
+              location /.well-known/acme-challenge/ {
+                  root /var/www/html;
+              }
+              location / {
+                  return 301 https://\$host\$request_uri;
+              }
           }
 
           server {
               listen 443 ssl;
-              server_name ${{ github.event.inputs.domain }};
+              server_name $DOMAIN;
 
-              ssl_certificate /etc/letsencrypt/live/${{ github.event.inputs.domain }}/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/${{ github.event.inputs.domain }}/privkey.pem;
+              ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
 
-              # SSL configuration
               ssl_protocols TLSv1.2 TLSv1.3;
               ssl_prefer_server_ciphers off;
-              ssl_ciphers "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384";
 
               location / {
                   proxy_pass http://localhost:3000;
@@ -101,23 +108,17 @@ jobs:
           }
           CONF
 
-          # Remove default Nginx site if it exists
-          sudo rm -f /etc/nginx/sites-enabled/default
+            # Enable the site
+            sudo ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
+            sudo rm -f /etc/nginx/sites-enabled/default
 
-          # Enable the site
-          sudo ln -sf /etc/nginx/sites-available/${{ github.event.inputs.domain }} /etc/nginx/sites-enabled/
-
-          # Test Nginx configuration
-          sudo nginx -t
-
-          # Start Nginx
-          sudo systemctl start nginx
-
-          # Verify Nginx is running
-          sudo systemctl status nginx
-
-          # Setup auto-renewal
-          sudo certbot renew --dry-run
+            # Test and restart Nginx
+            sudo nginx -t && sudo systemctl restart nginx
+          else
+            echo "Certificate not obtained. Check /var/log/letsencrypt/letsencrypt.log for details"
+            cat /var/log/letsencrypt/letsencrypt.log
+            exit 1
+          fi
           EOF
 
       - name: Verify Setup
