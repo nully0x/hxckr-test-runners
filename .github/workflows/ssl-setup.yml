@@ -1,4 +1,4 @@
-name: SSL Certificate Setup with Traefik
+name: SSL Certificate Setup
 
 on:
   workflow_dispatch:
@@ -9,8 +9,8 @@ on:
         type: string
 
 jobs:
-  traefik-setup:
-    name: Setup Traefik with SSL
+  ssl-setup:
+    name: Setup SSL Certificate with Nginx
     runs-on: ubuntu-latest
 
     steps:
@@ -21,125 +21,63 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.DROPLET_IP }} >> ~/.ssh/known_hosts
 
-      - name: Install and Configure Traefik
+      - name: Install and Configure SSL
         run: |
           ssh ${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_IP }} << 'EOF'
-          # Create directories for Traefik
-          sudo mkdir -p /etc/traefik
-          sudo mkdir -p /etc/traefik/dynamic
-          sudo mkdir -p /etc/traefik/acme
+          # Update package list
+          sudo apt-get update
 
-          # Create Traefik static configuration
-          sudo tee /etc/traefik/traefik.yml << 'TRAEFIK'
-          global:
-            checkNewVersion: true
-            sendAnonymousUsage: false
+          # Install Nginx and Certbot
+          sudo apt-get install -y nginx certbot python3-certbot-nginx
 
-          api:
-            dashboard: true
-            debug: true
+          # Create basic Nginx configuration for the domain
+          sudo tee /etc/nginx/sites-available/${{ github.event.inputs.domain }} << 'NGINX'
+          server {
+              listen 80;
+              server_name ${{ github.event.inputs.domain }};
 
-          entryPoints:
-            web:
-              address: ":80"
-              http:
-                redirections:
-                  entryPoint:
-                    to: websecure
-                    scheme: https
-                    permanent: true
-            websecure:
-              address: ":443"
+              location / {
+                  proxy_pass http://localhost:3000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+          NGINX
 
-          providers:
-            docker:
-              endpoint: "unix:///var/run/docker.sock"
-              exposedByDefault: false
-            file:
-              directory: "/etc/traefik/dynamic"
-              watch: true
+          # Enable the site
+          sudo ln -sf /etc/nginx/sites-available/${{ github.event.inputs.domain }} /etc/nginx/sites-enabled/
+          sudo rm -f /etc/nginx/sites-enabled/default
 
-          certificatesResolvers:
-            letsencrypt:
-              acme:
-                email: "${{ secrets.SSL_EMAIL }}"
-                storage: "/etc/traefik/acme/acme.json"
-                httpChallenge:
-                  entryPoint: web
-          TRAEFIK
+          # Test Nginx configuration
+          sudo nginx -t
 
-          # Create dynamic configuration for your Node.js app
-          sudo tee /etc/traefik/dynamic/node-app.yml << 'DYNAMIC'
-          http:
-            routers:
-              node-app:
-                rule: "Host(`${{ github.event.inputs.domain }}`)"
-                service: "node-app"
-                entryPoints:
-                  - "websecure"
-                tls:
-                  certResolver: "letsencrypt"
+          # Start/Restart Nginx
+          sudo systemctl restart nginx
 
-            services:
-              node-app:
-                loadBalancer:
-                  servers:
-                    - url: "http://localhost:3000"
-          DYNAMIC
+          # Obtain SSL certificate
+          sudo certbot --nginx \
+            --non-interactive \
+            --agree-tos \
+            --email ${{ secrets.SSL_EMAIL }} \
+            -d ${{ github.event.inputs.domain }}
 
-          # Create Traefik service file
-          sudo tee /etc/systemd/system/traefik.service << 'SERVICE'
-          [Unit]
-          Description=Traefik
-          Documentation=https://docs.traefik.io
-          After=network-online.target
-          Wants=network-online.target
+          # Setup automatic renewal
+          sudo systemctl enable certbot.timer
+          sudo systemctl start certbot.timer
 
-          [Service]
-          Type=simple
-          User=root
-          Group=root
-          ExecStart=/usr/local/bin/traefik --configfile=/etc/traefik/traefik.yml
-          Restart=on-failure
-          RestartSec=2
-          LimitNOFILE=1048576
+          # Test renewal process
+          sudo certbot renew --dry-run
 
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
+          # Verify Nginx status
+          sudo systemctl status nginx
 
-          # Download and install Traefik
-          TRAEFIK_VERSION=$(curl -s https://api.github.com/repos/traefik/traefik/releases/latest | grep tag_name | cut -d '"' -f 4)
-          sudo curl -L "https://github.com/traefik/traefik/releases/download/${TRAEFIK_VERSION}/traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz" -o traefik.tar.gz
-          sudo tar -zxvf traefik.tar.gz traefik
-          sudo mv traefik /usr/local/bin/
-          sudo chmod +x /usr/local/bin/traefik
-
-          # Create acme.json file
-          sudo touch /etc/traefik/acme/acme.json
-          sudo chmod 600 /etc/traefik/acme/acme.json
-
-          # Stop Nginx if it's running
-          if systemctl is-active --quiet nginx; then
-            sudo systemctl stop nginx
-            sudo systemctl disable nginx
-          fi
-
-          # Reload systemd and start Traefik
-          sudo systemctl daemon-reload
-          sudo systemctl enable traefik
-          sudo systemctl start traefik
-
-          # Wait for Traefik to start
-          sleep 10
-
-          # Check Traefik status
-          sudo systemctl status traefik
-
-          # Show logs
-          sudo journalctl -u traefik -n 50 --no-pager
+          # Show certificate information
+          sudo certbot certificates
           EOF
 
       - name: Verify Setup
         run: |
-          echo "Traefik setup completed for ${{ github.event.inputs.domain }}"
+          echo "SSL certificate setup completed for ${{ github.event.inputs.domain }}"
