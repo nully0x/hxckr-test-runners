@@ -1,4 +1,4 @@
-name: SSL Certificate Setup
+name: SSL Certificate Setup with Traefik
 
 on:
   workflow_dispatch:
@@ -9,8 +9,8 @@ on:
         type: string
 
 jobs:
-  ssl-setup:
-    name: Setup SSL Certificate
+  traefik-setup:
+    name: Setup Traefik with SSL
     runs-on: ubuntu-latest
 
     steps:
@@ -21,106 +21,125 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.DROPLET_IP }} >> ~/.ssh/known_hosts
 
-      - name: Verify Domain and Setup SSL
+      - name: Install and Configure Traefik
         run: |
           ssh ${{ secrets.DROPLET_USER }}@${{ secrets.DROPLET_IP }} << 'EOF'
-          # First, let's check DNS resolution
-          echo "Checking DNS resolution..."
-          DOMAIN="${{ github.event.inputs.domain }}"
-          DROPLET_IP=$(curl -s http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address)
-          DOMAIN_IP=$(dig +short $DOMAIN)
+          # Create directories for Traefik
+          sudo mkdir -p /etc/traefik
+          sudo mkdir -p /etc/traefik/dynamic
+          sudo mkdir -p /etc/traefik/acme
 
-          echo "Droplet IP: $DROPLET_IP"
-          echo "Domain IP: $DOMAIN_IP"
+          # Create Traefik static configuration
+          sudo tee /etc/traefik/traefik.yml << 'TRAEFIK'
+          global:
+            checkNewVersion: true
+            sendAnonymousUsage: false
 
-          if [ "$DROPLET_IP" != "$DOMAIN_IP" ]; then
-            echo "WARNING: Domain is not pointing to this server!"
-            echo "Please update DNS A record for $DOMAIN to point to $DROPLET_IP"
-            exit 1
-          fi
+          api:
+            dashboard: true
+            debug: true
 
-          # Check if ports are open
-          echo "Checking if port 80 is available..."
-          if netstat -tuln | grep ':80'; then
-            echo "Port 80 is in use. Stopping potential services..."
+          entryPoints:
+            web:
+              address: ":80"
+              http:
+                redirections:
+                  entryPoint:
+                    to: websecure
+                    scheme: https
+                    permanent: true
+            websecure:
+              address: ":443"
+
+          providers:
+            docker:
+              endpoint: "unix:///var/run/docker.sock"
+              exposedByDefault: false
+            file:
+              directory: "/etc/traefik/dynamic"
+              watch: true
+
+          certificatesResolvers:
+            letsencrypt:
+              acme:
+                email: "${{ secrets.SSL_EMAIL }}"
+                storage: "/etc/traefik/acme/acme.json"
+                httpChallenge:
+                  entryPoint: web
+          TRAEFIK
+
+          # Create dynamic configuration for your Node.js app
+          sudo tee /etc/traefik/dynamic/node-app.yml << 'DYNAMIC'
+          http:
+            routers:
+              node-app:
+                rule: "Host(`${{ github.event.inputs.domain }}`)"
+                service: "node-app"
+                entryPoints:
+                  - "websecure"
+                tls:
+                  certResolver: "letsencrypt"
+
+            services:
+              node-app:
+                loadBalancer:
+                  servers:
+                    - url: "http://localhost:3000"
+          DYNAMIC
+
+          # Create Traefik service file
+          sudo tee /etc/systemd/system/traefik.service << 'SERVICE'
+          [Unit]
+          Description=Traefik
+          Documentation=https://docs.traefik.io
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          Group=root
+          ExecStart=/usr/local/bin/traefik --configfile=/etc/traefik/traefik.yml
+          Restart=on-failure
+          RestartSec=2
+          LimitNOFILE=1048576
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+
+          # Download and install Traefik
+          TRAEFIK_VERSION=$(curl -s https://api.github.com/repos/traefik/traefik/releases/latest | grep tag_name | cut -d '"' -f 4)
+          sudo curl -L "https://github.com/traefik/traefik/releases/download/${TRAEFIK_VERSION}/traefik_${TRAEFIK_VERSION}_linux_amd64.tar.gz" -o traefik.tar.gz
+          sudo tar -zxvf traefik.tar.gz traefik
+          sudo mv traefik /usr/local/bin/
+          sudo chmod +x /usr/local/bin/traefik
+
+          # Create acme.json file
+          sudo touch /etc/traefik/acme/acme.json
+          sudo chmod 600 /etc/traefik/acme/acme.json
+
+          # Stop Nginx if it's running
+          if systemctl is-active --quiet nginx; then
             sudo systemctl stop nginx
-            sleep 5
+            sudo systemctl disable nginx
           fi
 
-          # Configure firewall
-          echo "Configuring firewall..."
-          sudo ufw allow 80/tcp
-          sudo ufw allow 443/tcp
-          sudo ufw --force enable
+          # Reload systemd and start Traefik
+          sudo systemctl daemon-reload
+          sudo systemctl enable traefik
+          sudo systemctl start traefik
 
-          # Install required packages
-          echo "Installing required packages..."
-          sudo apt-get update
-          sudo apt-get install -y certbot nginx
+          # Wait for Traefik to start
+          sleep 10
 
-          # Attempt to get certificate with debugging
-          echo "Attempting to obtain SSL certificate..."
-          sudo certbot certonly --standalone \
-            --preferred-challenges http \
-            --agree-tos \
-            --non-interactive \
-            --verbose \
-            --debug \
-            --email ${{ secrets.SSL_EMAIL }} \
-            -d $DOMAIN
+          # Check Traefik status
+          sudo systemctl status traefik
 
-          # Check certificate status
-          if [ -d "/etc/letsencrypt/live/$DOMAIN" ]; then
-            echo "Certificate obtained successfully!"
-
-            # Configure Nginx
-            echo "Configuring Nginx..."
-            sudo tee /etc/nginx/sites-available/$DOMAIN << CONF
-          server {
-              listen 80;
-              server_name $DOMAIN;
-              location /.well-known/acme-challenge/ {
-                  root /var/www/html;
-              }
-              location / {
-                  return 301 https://\$host\$request_uri;
-              }
-          }
-
-          server {
-              listen 443 ssl;
-              server_name $DOMAIN;
-
-              ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-              ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-
-              ssl_protocols TLSv1.2 TLSv1.3;
-              ssl_prefer_server_ciphers off;
-
-              location / {
-                  proxy_pass http://localhost:3000;
-                  proxy_http_version 1.1;
-                  proxy_set_header Upgrade \$http_upgrade;
-                  proxy_set_header Connection 'upgrade';
-                  proxy_set_header Host \$host;
-                  proxy_cache_bypass \$http_upgrade;
-              }
-          }
-          CONF
-
-            # Enable the site
-            sudo ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
-            sudo rm -f /etc/nginx/sites-enabled/default
-
-            # Test and restart Nginx
-            sudo nginx -t && sudo systemctl restart nginx
-          else
-            echo "Certificate not obtained. Check /var/log/letsencrypt/letsencrypt.log for details"
-            cat /var/log/letsencrypt/letsencrypt.log
-            exit 1
-          fi
+          # Show logs
+          sudo journalctl -u traefik -n 50 --no-pager
           EOF
 
       - name: Verify Setup
         run: |
-          echo "SSL certificate setup completed for ${{ github.event.inputs.domain }}"
+          echo "Traefik setup completed for ${{ github.event.inputs.domain }}"
